@@ -4,16 +4,31 @@
 const MAX_CONNECTIONS         = 20;
 const MAX_PENDING_HANDSHAKES  = 10;
 const HANDSHAKE_TIMEOUT_MS    = 3000;
-const IDLE_TIMEOUT_MS         = 120000;
 const MAX_CONN_PER_IP_PER_SEC = 5;
 const MAX_MSG_PER_IP_PER_SEC  = 10;
 const MAX_MSG_LENGTH          = 512;
 const MAX_USERNAME_LENGTH     = 32;
 
+// Ping/Pong — idle timeout yerine heartbeat kullanılıyor
+const PING_INTERVAL_MS = 30000;  // 30 saniyede bir ping
+const PONG_TIMEOUT_MS  = 10000;  // 10 saniye içinde pong gelmezse kes
+
 const HANDSHAKE_PREFIX = "MISMATCHR_HELLO:";
 const HANDSHAKE_OK     = "MISMATCHR_OK";
 const HANDSHAKE_RED    = "MISMATCHR_RED";
 const SISTEM_BAN       = "MISMATCHR_BAN";
+
+// ── IP gizleme: sunucu her yeniden başladığında yeni salt ─────
+const IP_SALT = crypto.randomUUID();
+
+async function hashIp(ip) {
+    const veri   = new TextEncoder().encode(IP_SALT + ip);
+    const buffer = await crypto.subtle.digest("SHA-256", veri);
+    return Array.from(new Uint8Array(buffer))
+        .slice(0, 6)
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+}
 
 // ── Güvenlik veri yapıları ────────────────────────────────────
 const karaListe         = new Set();
@@ -81,25 +96,27 @@ function kullaniciyiTemizle(ws, kullaniciAdi, handshakeDone) {
 }
 
 // ── HTTP + WebSocket handler ──────────────────────────────────
-Deno.serve((req) => {
-    // Sağlık kontrolü için HTTP GET
+Deno.serve(async (req) => {
+    // Sağlık kontrolü
     if (req.method === "GET" && !req.headers.get("upgrade")) {
         return new Response("Mismatchr sunucusu calisiyor.", { status: 200 });
     }
 
-    // WebSocket yükseltme
     if (req.headers.get("upgrade") !== "websocket") {
         return new Response("WebSocket gerekli.", { status: 426 });
     }
 
-    const gelenIp = (
+    const hamIp = (
         req.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
         req.headers.get("cf-connecting-ip") ||
         "unknown"
     ).replace(/^::ffff:/, "");
 
+    // IP hash — ham IP hiçbir yerde loglanmıyor
+    const gelenIp = await hashIp(hamIp);
+
     // ── Koruma 1: Kara liste ──────────────────────────────────
-    if (karaListe.has(gelenIp)) {
+    if (karaListe.has(hamIp)) {
         return new Response("Yasakli.", { status: 403 });
     }
 
@@ -109,9 +126,9 @@ Deno.serve((req) => {
     }
 
     // ── Koruma 3: DDoS hız sınırı ─────────────────────────────
-    if (!ipBaglantiHizKontrol(gelenIp)) {
-        karaListe.add(gelenIp);
-        log("WARN", `DDoS engellendi: ${gelenIp}`);
+    if (!ipBaglantiHizKontrol(hamIp)) {
+        karaListe.add(hamIp);
+        log("WARN", `DDoS engellendi: [${gelenIp}]`);
         return new Response("Cok fazla baglanti.", { status: 429 });
     }
 
@@ -125,28 +142,38 @@ Deno.serve((req) => {
 
     let handshakeDone = false;
     let kullaniciAdi  = null;
-    let idleTimer     = null;
+    let pingTimer     = null;
+    let sonPong       = Date.now();
 
     // ── Koruma 5: Slowloris ───────────────────────────────────
     const hsTimeout = setTimeout(() => {
         if (!handshakeDone) {
             ws.close();
             bekleyenElSikisma = Math.max(0, bekleyenElSikisma - 1);
-            log("WARN", `Handshake timeout: ${gelenIp}`);
+            log("WARN", `Handshake timeout: [${gelenIp}]`);
         }
     }, HANDSHAKE_TIMEOUT_MS);
 
-    const resetIdle = () => {
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-            log("INFO", `Idle timeout: ${gelenIp}`);
-            try { ws.send("sistem: Uzun sure hareketsiz kaldiniz, baglantiiniz kesildi."); } catch (_) {}
-            ws.close();
-        }, IDLE_TIMEOUT_MS);
+    // ── Ping/Pong heartbeat ───────────────────────────────────
+    // Idle timeout yerine kullanılır; AFK kullanıcılar bağlı kalır.
+    // NOT: C# client tarafında "sys:ping" mesajı alınca "sys:pong"
+    //      gönderilmesi gerekir. Örnek:
+    //        if (msg == "sys:ping") ws.Send("sys:pong");
+    const startPing = () => {
+        pingTimer = setInterval(() => {
+            const gecenSure = Date.now() - sonPong;
+            if (gecenSure > PING_INTERVAL_MS + PONG_TIMEOUT_MS) {
+                log("INFO", `Pong gelmedi, baglanti kesiliyor: [${gelenIp}]`);
+                try { ws.send("sistem: Baglanti zaman asimina ugradi."); } catch (_) {}
+                ws.close();
+                return;
+            }
+            try { ws.send("sys:ping"); } catch (_) {}
+        }, PING_INTERVAL_MS);
     };
 
     ws.onopen = () => {
-        log("INFO", `Yeni baglanti: ${gelenIp}`);
+        log("INFO", `Yeni baglanti: [${gelenIp}]`);
     };
 
     ws.onmessage = (event) => {
@@ -154,6 +181,12 @@ Deno.serve((req) => {
             .toString()
             .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
             .trim();
+
+        // ── Pong yanıtı ───────────────────────────────────────
+        if (msg === "sys:pong") {
+            sonPong = Date.now();
+            return;
+        }
 
         // ── El sıkışma ────────────────────────────────────────
         if (!handshakeDone) {
@@ -164,7 +197,7 @@ Deno.serve((req) => {
             if (!msg.startsWith(HANDSHAKE_PREFIX)) {
                 try { ws.send(HANDSHAKE_RED); } catch (_) {}
                 ws.close();
-                log("WARN", `Yanlis protokol: ${gelenIp}`);
+                log("WARN", `Yanlis protokol: [${gelenIp}]`);
                 return;
             }
 
@@ -190,35 +223,39 @@ Deno.serve((req) => {
             aktifKullanicilar.add(kullaniciAdi);
 
             broadcast(`sistem: ${kullaniciAdi} katildi! (${bagliBaglantilar.size}/${MAX_CONNECTIONS})`, ws);
-            log("INFO", `Baglandi. Toplam: ${bagliBaglantilar.size}`);
-            resetIdle();
+            log("INFO", `Baglandi [${gelenIp}]. Toplam: ${bagliBaglantilar.size}`);
+
+            // Handshake tamamlandı, heartbeat başlıyor
+            sonPong = Date.now();
+            startPing();
             return;
         }
 
         // ── Normal mesaj ──────────────────────────────────────
-        resetIdle();
-
-        if (!ipMesajHizKontrol(gelenIp)) {
-            karaListe.add(gelenIp);
+        if (!ipMesajHizKontrol(hamIp)) {
+            karaListe.add(hamIp);
             try { ws.send(SISTEM_BAN); } catch (_) {}
             ws.close();
-            log("WARN", `Mesaj flood bani: ${gelenIp}`);
+            log("WARN", `Mesaj flood bani: [${gelenIp}]`);
             return;
         }
 
         if (new TextEncoder().encode(msg).length > MAX_MSG_LENGTH) return;
         if (!msg) return;
         if (msg.startsWith("ADMIN:")) {
-            log("WARN", `Yetkisiz admin denemesi: ${gelenIp}`);
+            log("WARN", `Yetkisiz admin denemesi: [${gelenIp}]`);
             return;
         }
 
         broadcast(msg, ws);
-        log("MSG", `[${kullaniciAdi?.substring(0, 8) ?? "?"}...] iletildi`);
+
+        // Mesaj içeriği loglanıyor (max 80 karakter gösterilir)
+        const logMesaj = msg.length > 80 ? msg.substring(0, 80) + "…" : msg;
+        log("MSG", `[${kullaniciAdi ?? "?"}] -> ${logMesaj}`);
     };
 
     ws.onclose = () => {
-        clearTimeout(idleTimer);
+        clearInterval(pingTimer);
         clearTimeout(hsTimeout);
         kullaniciyiTemizle(ws, kullaniciAdi, handshakeDone);
     };
