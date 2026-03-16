@@ -7,6 +7,6 @@ RUN npm install --production
 
 COPY . .
 
-EXPOSE 7777
+EXPOSE 8080
 
 CMD ["node", "server.js"]
