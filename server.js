@@ -1,20 +1,19 @@
-const WebSocket = require('ws');
+// Deno Deploy — Mismatchr WebSocket Sunucusu
 
 // ── Sabitler ─────────────────────────────────────────────────
-const PORT                    = process.env.PORT || 8080;
 const MAX_CONNECTIONS         = 20;
 const MAX_PENDING_HANDSHAKES  = 10;
 const HANDSHAKE_TIMEOUT_MS    = 3000;
-const IDLE_TIMEOUT_MS         = 120000;        // 2 dakika hareketsizlik
+const IDLE_TIMEOUT_MS         = 120000;
 const MAX_CONN_PER_IP_PER_SEC = 5;
 const MAX_MSG_PER_IP_PER_SEC  = 10;
-const MAX_MSG_LENGTH          = 512;           // byte
+const MAX_MSG_LENGTH          = 512;
 const MAX_USERNAME_LENGTH     = 32;
 
-const HANDSHAKE_PREFIX = 'MISMATCHR_HELLO:';
-const HANDSHAKE_OK     = 'MISMATCHR_OK';
-const HANDSHAKE_RED    = 'MISMATCHR_RED';
-const SISTEM_BAN       = 'MISMATCHR_BAN';
+const HANDSHAKE_PREFIX = "MISMATCHR_HELLO:";
+const HANDSHAKE_OK     = "MISMATCHR_OK";
+const HANDSHAKE_RED    = "MISMATCHR_RED";
+const SISTEM_BAN       = "MISMATCHR_BAN";
 
 // ── Güvenlik veri yapıları ────────────────────────────────────
 const karaListe         = new Set();
@@ -23,19 +22,15 @@ const ipSonBaglanti     = new Map();
 const ipMesajSayac      = new Map();
 const ipSonMesaj        = new Map();
 const aktifKullanicilar = new Set();
-const kullaniciMap      = new Map();  // kullaniciAdi → ws
-const kullaniciIpMap    = new Map();  // kullaniciAdi → ip
+const kullaniciMap      = new Map();
+const kullaniciIpMap    = new Map();
 const bagliBaglantilar  = new Set();
 let   bekleyenElSikisma = 0;
 
-// ── Yardımcı: güvenli log (kullanıcı girdisi direkt basılmaz) ─
 function log(seviye, mesaj) {
-    const zaman = new Date().toISOString();
-    // Kullanıcıdan gelen veri logda gösterilmez — log injection önlemi
-    console.log(`[${zaman}] [${seviye}] ${mesaj}`);
+    console.log(`[${new Date().toISOString()}] [${seviye}] ${mesaj}`);
 }
 
-// ── Koruma: DDoS bağlantı hız sınırı ─────────────────────────
 function ipBaglantiHizKontrol(ip) {
     const now = Date.now();
     if (ipSonBaglanti.has(ip) && (now - ipSonBaglanti.get(ip)) >= 1000)
@@ -46,7 +41,6 @@ function ipBaglantiHizKontrol(ip) {
     return count <= MAX_CONN_PER_IP_PER_SEC;
 }
 
-// ── Koruma: Mesaj flood ───────────────────────────────────────
 function ipMesajHizKontrol(ip) {
     const now = Date.now();
     if (ipSonMesaj.has(ip) && (now - ipSonMesaj.get(ip)) >= 1000)
@@ -57,17 +51,15 @@ function ipMesajHizKontrol(ip) {
     return count <= MAX_MSG_PER_IP_PER_SEC;
 }
 
-// ── Kullanıcı adı sanitize (XSS / injection önlemi) ──────────
 function sanitizeAd(adi) {
     return adi
-        .replace(/[^\w\u00C0-\u024F\u4E00-\u9FFF _\-\.]/g, '')  // sadece harf/rakam/unicode
+        .replace(/[^\w\u00C0-\u024F\u4E00-\u9FFF _\-\.]/g, "")
         .substring(0, MAX_USERNAME_LENGTH)
         .trim();
 }
 
-// ── Broadcast ─────────────────────────────────────────────────
 function broadcast(mesaj, haric = null) {
-    const data = mesaj.substring(0, MAX_MSG_LENGTH * 2); // broadcast da uzunluk sınırı
+    const data = mesaj.substring(0, MAX_MSG_LENGTH * 2);
     for (const client of bagliBaglantilar) {
         if (client === haric) continue;
         if (client.readyState === WebSocket.OPEN)
@@ -75,95 +67,92 @@ function broadcast(mesaj, haric = null) {
     }
 }
 
-// ── Kullanıcı temizle ─────────────────────────────────────────
 function kullaniciyiTemizle(ws, kullaniciAdi, handshakeDone) {
-    if (!handshakeDone) {
+    if (!handshakeDone)
         bekleyenElSikisma = Math.max(0, bekleyenElSikisma - 1);
-    }
     if (kullaniciAdi) {
         bagliBaglantilar.delete(ws);
         kullaniciMap.delete(kullaniciAdi);
         kullaniciIpMap.delete(kullaniciAdi);
         aktifKullanicilar.delete(kullaniciAdi);
         broadcast(`sistem: Bir kullanici ayrildi. (${bagliBaglantilar.size}/${MAX_CONNECTIONS})`);
-        log('INFO', `Kullanici ayrildi. Toplam: ${bagliBaglantilar.size}`);
+        log("INFO", `Kullanici ayrildi. Toplam: ${bagliBaglantilar.size}`);
     }
 }
 
-// ── WebSocket Sunucusu ────────────────────────────────────────
-const wss = new WebSocket.Server({ port: PORT });
+// ── HTTP + WebSocket handler ──────────────────────────────────
+Deno.serve((req) => {
+    // Sağlık kontrolü için HTTP GET
+    if (req.method === "GET" && !req.headers.get("upgrade")) {
+        return new Response("Mismatchr sunucusu calisiyor.", { status: 200 });
+    }
 
-wss.on('connection', (ws, req) => {
+    // WebSocket yükseltme
+    if (req.headers.get("upgrade") !== "websocket") {
+        return new Response("WebSocket gerekli.", { status: 426 });
+    }
 
-    // IP tespiti — proxy arkasında da çalışır
     const gelenIp = (
-        (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-        req.socket?.remoteAddress ||
-        'unknown'
-    ).replace(/^::ffff:/, ''); // IPv4-mapped IPv6 temizle
+        req.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+        req.headers.get("cf-connecting-ip") ||
+        "unknown"
+    ).replace(/^::ffff:/, "");
 
     // ── Koruma 1: Kara liste ──────────────────────────────────
-    if (karaListe.has(gelenIp)) { ws.close(); return; }
+    if (karaListe.has(gelenIp)) {
+        return new Response("Yasakli.", { status: 403 });
+    }
 
     // ── Koruma 2: Max bağlantı ────────────────────────────────
     if (bagliBaglantilar.size >= MAX_CONNECTIONS) {
-        ws.close();
-        log('WARN', `Max baglanti asimi. Red: ${gelenIp}`);
-        return;
+        return new Response("Sunucu dolu.", { status: 503 });
     }
 
-    // ── Koruma 3: DDoS bağlantı hız sınırı ───────────────────
+    // ── Koruma 3: DDoS hız sınırı ─────────────────────────────
     if (!ipBaglantiHizKontrol(gelenIp)) {
         karaListe.add(gelenIp);
-        ws.close();
-        log('WARN', `DDoS engellendi: ${gelenIp}`);
-        return;
+        log("WARN", `DDoS engellendi: ${gelenIp}`);
+        return new Response("Cok fazla baglanti.", { status: 429 });
     }
 
-    // ── Koruma 4: Bekleyen el sıkışma flood ───────────────────
+    // ── Koruma 4: Pending flood ───────────────────────────────
     if (++bekleyenElSikisma > MAX_PENDING_HANDSHAKES) {
         bekleyenElSikisma--;
-        ws.close();
-        return;
+        return new Response("Sunucu mesgul.", { status: 503 });
     }
 
-    // ── Durum ─────────────────────────────────────────────────
+    const { socket: ws, response } = Deno.upgradeWebSocket(req);
+
     let handshakeDone = false;
     let kullaniciAdi  = null;
     let idleTimer     = null;
 
-    // ── Koruma 5: Slowloris — el sıkışma timeout ──────────────
+    // ── Koruma 5: Slowloris ───────────────────────────────────
     const hsTimeout = setTimeout(() => {
         if (!handshakeDone) {
             ws.close();
             bekleyenElSikisma = Math.max(0, bekleyenElSikisma - 1);
-            log('WARN', `Handshake timeout: ${gelenIp}`);
+            log("WARN", `Handshake timeout: ${gelenIp}`);
         }
     }, HANDSHAKE_TIMEOUT_MS);
 
-    // ── Idle timer (her mesajda sıfırlanır) ───────────────────
     const resetIdle = () => {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
-            // Idle mesajında kullanıcı adı GÖSTERILMEZ — log injection önlemi
-            log('INFO', `Idle timeout. IP: ${gelenIp}`);
-            // Bağlı kullanıcıya sadece genel bilgi
-            try { ws.send('sistem: Uzun süre hareketsiz kaldınız, bağlantınız kesildi.'); } catch (_) {}
+            log("INFO", `Idle timeout: ${gelenIp}`);
+            try { ws.send("sistem: Uzun sure hareketsiz kaldiniz, baglantiiniz kesildi."); } catch (_) {}
             ws.close();
         }, IDLE_TIMEOUT_MS);
     };
 
-    // ── Mesaj handler ─────────────────────────────────────────
-    ws.on('message', (rawData) => {
+    ws.onopen = () => {
+        log("INFO", `Yeni baglanti: ${gelenIp}`);
+    };
 
-        // ── Koruma 6: Binary veri reddi ───────────────────────
-        if (Buffer.isBuffer(rawData) && rawData.length > MAX_MSG_LENGTH) {
-            ws.close(); return;
-        }
-
-        // Null byte ve kontrol karakteri temizle
-        const msg = rawData.toString('utf8')
-            .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '')
+    ws.onmessage = (event) => {
+        const msg = event.data
+            .toString()
+            .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
             .trim();
 
         // ── El sıkışma ────────────────────────────────────────
@@ -172,24 +161,18 @@ wss.on('connection', (ws, req) => {
             bekleyenElSikisma = Math.max(0, bekleyenElSikisma - 1);
             handshakeDone = true;
 
-            // ── Koruma 7: Yanlış protokol ─────────────────────
             if (!msg.startsWith(HANDSHAKE_PREFIX)) {
                 try { ws.send(HANDSHAKE_RED); } catch (_) {}
                 ws.close();
-                log('WARN', `Yanlis protokol: ${gelenIp}`);
+                log("WARN", `Yanlis protokol: ${gelenIp}`);
                 return;
             }
 
             let adi = msg.substring(HANDSHAKE_PREFIX.length).trim();
-
-            // ── Koruma 8: Boş / uzun kullanıcı adı ───────────
-            if (!adi || adi.length < 1) { adi = 'anonim'; }
-
-            // ── Koruma 9: Kullanıcı adı sanitize ─────────────
+            if (!adi) adi = "anonim";
             adi = sanitizeAd(adi);
-            if (!adi) adi = 'kullanici';
+            if (!adi) adi = "kullanici";
 
-            // ── Koruma 10: Duplicate username ─────────────────
             if (aktifKullanicilar.has(adi)) {
                 let sayac = 2;
                 let yeniAd = `${adi}#${sayac}`;
@@ -206,9 +189,8 @@ wss.on('connection', (ws, req) => {
             kullaniciIpMap.set(kullaniciAdi, gelenIp);
             aktifKullanicilar.add(kullaniciAdi);
 
-            // Katılma bildirimi — kullanıcı adı sanitize edilmiş
             broadcast(`sistem: ${kullaniciAdi} katildi! (${bagliBaglantilar.size}/${MAX_CONNECTIONS})`, ws);
-            log('INFO', `Baglandi. Toplam: ${bagliBaglantilar.size}`);
+            log("INFO", `Baglandi. Toplam: ${bagliBaglantilar.size}`);
             resetIdle();
             return;
         }
@@ -216,52 +198,34 @@ wss.on('connection', (ws, req) => {
         // ── Normal mesaj ──────────────────────────────────────
         resetIdle();
 
-        // ── Koruma 11: Mesaj flood ────────────────────────────
         if (!ipMesajHizKontrol(gelenIp)) {
             karaListe.add(gelenIp);
             try { ws.send(SISTEM_BAN); } catch (_) {}
             ws.close();
-            log('WARN', `Mesaj flood bani: ${gelenIp}`);
+            log("WARN", `Mesaj flood bani: ${gelenIp}`);
             return;
         }
 
-        // ── Koruma 12: Mesaj boyutu ───────────────────────────
-        if (Buffer.byteLength(msg, 'utf8') > MAX_MSG_LENGTH) {
-            log('WARN', `Uzun mesaj reddedildi: ${gelenIp}`);
-            return;
-        }
-
-        // ── Koruma 13: Boş mesaj ──────────────────────────────
+        if (new TextEncoder().encode(msg).length > MAX_MSG_LENGTH) return;
         if (!msg) return;
-
-        // ── Koruma 14: ADMIN komutu taklidi engeli ────────────
-        // Client'tan ADMIN: ile başlayan mesajlar doğrudan reddedilir
-        // (AdminPanel ayrı bir araçtır, client'ta yoktur)
-        if (msg.startsWith('ADMIN:')) {
-            log('WARN', `Yetkisiz admin denemesi: ${gelenIp}`);
+        if (msg.startsWith("ADMIN:")) {
+            log("WARN", `Yetkisiz admin denemesi: ${gelenIp}`);
             return;
         }
 
-        // Normal broadcast
         broadcast(msg, ws);
-        log('MSG', `[${kullaniciAdi?.substring(0,8) ?? '?'}...] iletildi`);
-    });
+        log("MSG", `[${kullaniciAdi?.substring(0, 8) ?? "?"}...] iletildi`);
+    };
 
-    // ── Bağlantı kapandığında ─────────────────────────────────
-    ws.on('close', () => {
+    ws.onclose = () => {
         clearTimeout(idleTimer);
         clearTimeout(hsTimeout);
         kullaniciyiTemizle(ws, kullaniciAdi, handshakeDone);
-    });
+    };
 
-    ws.on('error', (err) => {
-        log('ERROR', `WS hatasi: ${err.code ?? 'unknown'}`);
-        ws.close();
-    });
+    ws.onerror = () => ws.close();
+
+    return response;
 });
 
-wss.on('error', (err) => {
-    log('FATAL', `Sunucu hatasi: ${err.message}`);
-});
-
-log('INFO', `Mismatchr sunucusu calisiyor. Port: ${PORT} | Max: ${MAX_CONNECTIONS} baglanti`);
+log("INFO", `Mismatchr Deno sunucusu calisiyor. Max: ${MAX_CONNECTIONS} baglanti`);
