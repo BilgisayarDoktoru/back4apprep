@@ -31,7 +31,6 @@ Sunucu  → MISMATCHR_BAN  (kalıcı ban)
 | 12 | Null byte | Kontrol karakterleri temizlenir |
 | 13 | Admin taklit koruması | `ADMIN:` ile başlayan mesajlar reddedilir |
 | 14 | Idle timeout | 2 dakika hareketsiz bağlantı otomatik kesilir |
-| 15 | Güvenli log | Kullanıcı girdisi log çıktısına yansıtılmaz |
 
 ## Ortam Değişkenleri
 
